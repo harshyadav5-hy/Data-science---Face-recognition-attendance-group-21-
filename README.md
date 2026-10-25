@@ -1,4 +1,4 @@
-# Face Attendance Pro
+# Face Attendance
 
 Desktop attendance system for classes: enroll students by **Reg No + name**, mark attendance by face,
 report/export to CSV. No TensorFlow, no training step.
