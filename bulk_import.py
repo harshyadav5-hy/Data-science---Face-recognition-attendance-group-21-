@@ -1,4 +1,4 @@
-"""Enroll many students from existing photos (e.g. your old `dataset/` folder).
+"""Enroll many students from existing photos [e.g. your old `dataset/` folder].
 
 CSV columns (header required):  reg_no,name,department,section,folder
 `folder` is the sub-folder of --images that holds that student's photos.
