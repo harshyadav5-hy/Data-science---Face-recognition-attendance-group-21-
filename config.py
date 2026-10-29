@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 APP_NAME = "Face Attendance Pro"
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 # ---------------------------------------------------------------- paths
 BASE_DIR = Path(__file__).resolve().parent
@@ -13,6 +13,7 @@ MODELS_DIR = BASE_DIR / "models"
 FACES_DIR = DATA_DIR / "faces"          # aligned face crops kept for audit / re-embedding
 EXPORT_DIR = DATA_DIR / "exports"
 BACKUP_DIR = DATA_DIR / "backups"
+SPOOF_DIR = DATA_DIR / "spoof_alerts"    # snapshots of photo / replay attempts (evidence)
 DB_PATH = DATA_DIR / "attendance.db"
 LOG_PATH = DATA_DIR / "app.log"
 
@@ -58,43 +59,61 @@ MATCH_THRESHOLD = 0.40
 MATCH_MARGIN = 0.05          # best identity must beat the runner-up by this much
 DUPLICATE_THRESHOLD = 0.50   # at enrolment: refuse if the face already belongs to another Reg No
 
-CONFIRM_WINDOW = 5           # look at the last N frames of a tracked face ...
-CONFIRM_FRAMES = 3           # ... and need this many agreeing frames to name / mark it
+CONFIRM_WINDOW = 6           # look at the last N frames of a tracked face ...
+CONFIRM_FRAMES = 4           # ... and need this many agreeing frames before marking
 TRACK_TTL = 1.5              # seconds a track survives without a detection
 
-# Face-swap detection: if the face inside one tracked box suddenly stops resembling the previous
-# frames (a different person stepped in, or a photo was swapped in), the track is reset at once
-# instead of keeping the old identity. Same person frame-to-frame is normally > 0.6 similarity.
-SWAP_SIMILARITY = 0.25
-SWAP_FRAMES = 2              # consecutive dissimilar frames needed (ignores one bad/blurred frame)
+# ---------------------------------------------------------------- recognition quality
+FUSE_FRAMES = 5             # embeddings of the last N frames are averaged into one more stable template
+FUSE_MIN = 3
+MATCH_TOPK = 2              # identity score = mean of its best K samples (one lucky sample can't match)
+RECOG_MAX_YAW = 0.20        # frames turned further than this are not used to identify (poor accuracy)
+RECOG_MIN_SHARPNESS = 12.0  # blurry / dark / glaring frames are skipped instead of being matched
+RECOG_MIN_BRIGHT = 35
+RECOG_MAX_BRIGHT = 225
+LOSE_FRAMES = 4             # this many consecutive frames NOT matching the shown identity -> drop it
+RECHECK_INTERVAL = 0.5      # already-marked faces are re-verified this often (detects a person swap)
+RECHECK_MISSES = 3          # consecutive failed re-checks before the label is withdrawn
+NEAR_MISS_FRAMES = 5        # consistent "almost matches" frames before the 'face changed?' hint appears
+NEAR_MISS_MIN = 0.28
 
-# ---------------------------------------------------------------- live-person checks (anti-spoofing)
-# LIVE mode (default in the app) accepts only a physically present person, using three layers:
-#   1. passive photo/screen detector (two MiniFASNet models, Apache-2.0, minivision-ai)
-#   2. random head-turn challenge measured with a photo-proof 3-D cue (see face_engine.face_turn)
-#   3. identity + face-continuity checks, so the person who turns is the person who is marked
-ANTISPOOF_REQUIRED = True        # True = no attendance is marked unless the photo detector is loaded
-ANTISPOOF_MODELS = [
-    {"file": "MiniFASNetV2.onnx", "scale": 2.7, "min_bytes": 1_000_000,
-     "sha256": "b32929adc2d9c34b9486f8c4c7bc97c1b69bc0ea9befefc380e4faae4e463907",
-     "urls": ["https://github.com/yakhyo/face-anti-spoofing/releases/download/weights/MiniFASNetV2.onnx"]},
-    {"file": "MiniFASNetV1SE.onnx", "scale": 4.0, "min_bytes": 1_000_000,
-     "sha256": "ebab7f90c7833fbccd46d3a555410e78d969db5438e169b6524be444862b3676",
-     "urls": ["https://github.com/yakhyo/face-anti-spoofing/releases/download/weights/MiniFASNetV1SE.onnx"]},
+# ---------------------------------------------------------------- adaptive templates (face changed)
+# After a LIVE, confirmed match, a new view of the face (glasses, beard, hair, lighting) is added to
+# that student's templates immediately, so the next frames already recognise it.
+ADAPT_ENABLED = True
+ADAPT_MIN_SCORE = 0.45       # only confident matches are ever learned from
+ADAPT_MAX_SIMILARITY = 0.80  # skip if an existing template already looks like this (nothing new)
+ADAPT_MAX_OTHER = 0.30       # skip if the face is also similar to a different student (ambiguous)
+MAX_AUTO_TEMPLATES = 8       # automatic samples kept per student (oldest dropped first)
+MAX_UPDATE_TEMPLATES = 12    # samples added by the admin "Update look" action
+UPDATE_PROMPTS = [           # quick admin-confirmed update (Students tab -> Update look)
+    ("Look straight at the camera", "front"),
+    ("Turn your head slightly to your LEFT", "left"),
+    ("Turn your head slightly to your RIGHT", "right"),
+    ("Look straight and smile", "front"),
 ]
-ANTISPOOF_REAL_THRESHOLD = 0.60  # mean "real" probability needed to count as a live face
-ANTISPOOF_HYSTERESIS = 0.10      # a live face is only called a photo when it drops below THRESHOLD - this
-ANTISPOOF_WINDOW = 8             # frames averaged per tracked face
-ANTISPOOF_MIN_FRAMES = 4         # frames needed before a verdict
-ANTISPOOF_ALERT_COOLDOWN = 15.0  # seconds between repeated warnings/audit entries for the same person
-SHOW_DEBUG_SCORES = False        # True = print live "real" score and match similarity on the video (tuning)
 
-LIVENESS_STEPS = 2               # random head-turn steps: 2 = turn left AND right (random order), 1 = one side
-LIVENESS_FRONT_MAX = 0.14        # |turn| below this counts as "looking straight" (must be seen first)
-LIVENESS_TURN_MIN = 0.18         # turn needed (~19 degrees); a flat photo stays near 0 even when tilted
-LIVENESS_TURN_MAX = 0.80         # beyond this the landmarks are unreliable
-LIVENESS_HOLD_FRAMES = 3         # consecutive frames the turn must be held
-LIVENESS_TIMEOUT = 10.0          # seconds to finish the challenge before a new random one starts
+# ---------------------------------------------------------------- liveness (anti-photo) - ALWAYS ON
+# Every student must pass a random 3-D head-turn challenge (turn to one side, then the other, then
+# look straight) before attendance is marked. Nose position is measured in the face's own
+# coordinate frame (eyes + mouth), which does not change when a flat photo is moved, rolled or
+# tilted - only a real 3-D head changes it.
+LIVENESS_TURN = 0.16          # nose shift needed to count as a head turn (real 20 deg turn ~ 0.2)
+LIVENESS_NEUTRAL_MAX = 0.12   # |nose offset| allowed while measuring the straight-ahead pose
+LIVENESS_NEUTRAL_FRAMES = 4
+LIVENESS_NEUTRAL_SPREAD = 0.05  # ... and steady (nose offset varies less than this)
+LIVENESS_HOLD_FRAMES = 3      # frames the turn must be held (median-filtered)
+LIVENESS_VERIFY_FRAMES = 3    # frames looking straight again to finish
+LIVENESS_TIMEOUT = 12.0       # seconds to finish; otherwise "no live movement - possible photo"
+LIVENESS_JUMP = 0.45          # an instant nose jump this big per frame = swapped picture -> restart
+LIVENESS_FLAT_RATIO = 0.86    # face got >=14% narrower (tilted away) ...
+LIVENESS_FLAT_MAX_SHIFT = 0.08  # ... while the nose did not move in the face = flat picture tilted
+LIVENESS_FLAT_FRAMES = 5
+VERIFY_TIMEOUT = 6.0          # seconds allowed to re-confirm identity after the challenge
+SPOOF_RED_SECONDS = 4.0       # how long the red PHOTO warning stays on the face
+SAVE_SPOOF_SNAPSHOTS = True   # keep a cropped photo of each spoof attempt in data/spoof_alerts
+SPOOF_KEEP = 200
+LIVENESS_DEBUG = False        # True: show nose shift (dU) and face-width ratio (f) on the label
 
 # ---------------------------------------------------------------- enrolment
 ENROLL_PROMPTS = [

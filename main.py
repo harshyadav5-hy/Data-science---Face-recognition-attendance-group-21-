@@ -1,6 +1,6 @@
 """Face Attendance Pro - PyQt5 desktop application.
 
-Run: python main.py
+Run:  python main.py
 """
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 import config
 from database import Database, normalize_reg_no, now_str, student_dir, write_csv
-from face_engine import AntiSpoof, FaceEngine, Gallery, ensure_antispoof_models, ensure_models
-from pipeline import AttendanceProcessor, EnrollmentSession
+from face_engine import FaceEngine, Gallery, ensure_models
+from pipeline import AttendanceProcessor, EnrollmentSession, adaptive_template_ok
 
 log = logging.getLogger("app")
 
@@ -41,9 +41,8 @@ class CameraWorker(QThread):
     """Owns the camera and the DNNs. All heavy work happens here, never in the GUI thread."""
 
     frame_ready = pyqtSignal(QtGui.QImage, list, list)   # image, overlays, hud lines
-    identity_confirmed = pyqtSignal(str, float)           # reg_no, score
-    spoof_detected = pyqtSignal(str, str, float)          # reg_no ("" if unknown), "Name (REG)", live-score
-    antispoof_problem = pyqtSignal(str)                   # photo detector could not be loaded
+    identity_confirmed = pyqtSignal(str, float, object)   # reg_no, score, fused embedding
+    spoof_detected = pyqtSignal(str, str, str)            # kind (photo|timeout), reg_no, message
     enroll_finished = pyqtSignal(object)                  # EnrollResult or None (cancelled)
     status = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -55,19 +54,20 @@ class CameraWorker(QThread):
         self._lock = threading.Lock()
         self._mode = "preview"            # preview | attendance | enroll
         self._gallery = Gallery.empty()
-        self._session_args = (set(), True)     # (already marked, live_only)
-        self._antispoof = None
+        self._session_marked: set = set()
         self._attendance = None
         self._enroll = None
         self._cancel_enroll = False
+        self._enroll_prompts = None
 
     # ---- control (called from the GUI thread)
     def set_gallery(self, gallery: Gallery) -> None:
         self._gallery = gallery
 
-    def begin_session(self, marked: set, live_only: bool = True) -> None:
+    def begin_session(self, marked: set) -> None:
+        """Anti-photo liveness is always on; there is deliberately no switch to disable it."""
         with self._lock:
-            self._session_args = (set(marked), bool(live_only))
+            self._session_marked = set(marked)
             self._attendance = None
             self._mode = "attendance"
 
@@ -76,8 +76,9 @@ class CameraWorker(QThread):
             self._attendance = None
             self._mode = "preview"
 
-    def begin_enrollment(self) -> None:
+    def begin_enrollment(self, prompts=None) -> None:
         with self._lock:
+            self._enroll_prompts = prompts
             self._enroll = None
             self._cancel_enroll = False
             self._mode = "enroll"
@@ -98,13 +99,6 @@ class CameraWorker(QThread):
             log.exception("Model initialisation failed")
             self.failed.emit(str(exc))
             return
-
-        try:
-            self._antispoof = AntiSpoof(ensure_antispoof_models(self.status.emit))
-        except Exception as exc:                     # live attendance stays paused (ANTISPOOF_REQUIRED)
-            log.exception("Photo detector unavailable")
-            self._antispoof = None
-            self.antispoof_problem.emit(str(exc))
 
         cap = None
         failures = 0
@@ -149,23 +143,20 @@ class CameraWorker(QThread):
         with self._lock:
             mode = self._mode
             if mode == "attendance" and self._attendance is None:
-                marked, live_only = self._session_args
-                self._attendance = AttendanceProcessor(
-                    engine, self._gallery, marked, live_only,
-                    antispoof=self._antispoof if live_only else None,
-                    antispoof_required=config.ANTISPOOF_REQUIRED and live_only)
+                self._attendance = AttendanceProcessor(engine, self._gallery, set(self._session_marked))
             if mode == "enroll" and self._enroll is None:
-                self._enroll = EnrollmentSession(engine)
+                self._enroll = EnrollmentSession(engine, self._enroll_prompts)
             attendance, enroll = self._attendance, self._enroll
             cancel, self._cancel_enroll = self._cancel_enroll, False
 
         if mode == "attendance" and attendance is not None:
             attendance.gallery = self._gallery
             overlays, events, hud = attendance.process(frame, faces)
-            for reg_no, score in events:
-                self.identity_confirmed.emit(reg_no, score)
+            for reg_no, score, embedding in events:
+                self.identity_confirmed.emit(reg_no, score, embedding)
             for alert in attendance.pop_alerts():
-                self.spoof_detected.emit(alert.reg_no or "", alert.label, alert.score)
+                self._save_snapshot(frame, alert)
+                self.spoof_detected.emit(alert.kind, alert.reg_no, alert.text)
             return overlays, hud
         if mode == "enroll" and enroll is not None:
             if cancel:
@@ -176,6 +167,23 @@ class CameraWorker(QThread):
                 self._finish_enroll(result)
             return overlays, hud
         return [(float(f[0]), float(f[1]), float(f[2]), float(f[3]), "", "#38bdf8") for f in faces], []
+
+    def _save_snapshot(self, frame, alert) -> None:
+        """Keep a cropped picture of each photo / no-liveness attempt as evidence (newest N kept)."""
+        if not config.SAVE_SPOOF_SNAPSHOTS:
+            return
+        try:
+            x, y, w, h = (int(v) for v in alert.box)
+            margin = int(0.4 * max(w, h))
+            height, width = frame.shape[:2]
+            crop = frame[max(y - margin, 0):min(y + h + margin, height), max(x - margin, 0):min(x + w + margin, width)]
+            config.SPOOF_DIR.mkdir(parents=True, exist_ok=True)
+            name = f"{datetime.now():%Y%m%d_%H%M%S}_{student_dir(alert.reg_no).name}_{alert.kind}.jpg"
+            cv2.imwrite(str(config.SPOOF_DIR / name), crop)
+            for old in sorted(config.SPOOF_DIR.glob("*.jpg"))[:-config.SPOOF_KEEP]:
+                old.unlink(missing_ok=True)
+        except Exception:
+            log.exception("Could not save spoof snapshot")
 
     def _finish_enroll(self, result) -> None:
         with self._lock:
@@ -313,8 +321,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.session_id = None
         self.session_deadline = "00:00:00"
         self._enroll_ctx = None
-        self.session_method = "face"
-        self._spoof_count = 0
         self._report_header: list = []
         self._report_rows: list = []
 
@@ -351,19 +357,7 @@ class MainWindow(QtWidgets.QMainWindow):
         page = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(page)
         self.view_att = CameraView()
-        left = QtWidgets.QVBoxLayout()
-        self.lbl_alert = QtWidgets.QLabel("")
-        self.lbl_alert.setWordWrap(True)
-        self.lbl_alert.setAlignment(Qt.AlignCenter)
-        self.lbl_alert.setStyleSheet("background:#b91c1c; color:white; font-size:17px; font-weight:bold;"
-                                     "padding:12px; border-radius:6px;")
-        self.lbl_alert.hide()
-        self._alert_timer = QtCore.QTimer(self)
-        self._alert_timer.setSingleShot(True)
-        self._alert_timer.timeout.connect(self.lbl_alert.hide)
-        left.addWidget(self.lbl_alert)
-        left.addWidget(self.view_att, 1)
-        layout.addLayout(left, 3)
+        layout.addWidget(self.view_att, 3)
 
         side = QtWidgets.QVBoxLayout()
         box = QtWidgets.QGroupBox("Class session")
@@ -373,17 +367,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_subject.lineEdit().setPlaceholderText("Subject / course, e.g. PHY402")
         self.time_late = QtWidgets.QTimeEdit(QtCore.QTime.currentTime().addSecs(600))
         self.time_late.setDisplayFormat("HH:mm")
-        self.cmb_mode = QtWidgets.QComboBox()
-        self.cmb_mode.addItem("Live person only (recommended)", "live")
-        self.cmb_mode.addItem("Photo attendance (photos accepted)", "photo")
-        self.lbl_mode_hint = QtWidgets.QLabel()
-        self.lbl_mode_hint.setWordWrap(True)
-        self.cmb_mode.currentIndexChanged.connect(self._update_mode_hint)
+        lbl_live = QtWidgets.QLabel("Live person required: each student must turn their head when asked.\n"
+                                    "Photos, phone screens and printouts are rejected and reported.")
+        lbl_live.setWordWrap(True)
+        lbl_live.setStyleSheet("color: #15803d; font-weight: bold;")
         form.addRow("Subject", self.cmb_subject)
         form.addRow("On time until", self.time_late)
-        form.addRow("Attendance mode", self.cmb_mode)
-        form.addRow(self.lbl_mode_hint)
-        self._update_mode_hint()
+        form.addRow(lbl_live)
         row = QtWidgets.QHBoxLayout()
         self.btn_start = QtWidgets.QPushButton("Start session")
         self.btn_end = QtWidgets.QPushButton("End session")
@@ -395,6 +385,14 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow(row)
         side.addWidget(box)
 
+        self.lbl_alert = QtWidgets.QLabel("")
+        self.lbl_alert.setWordWrap(True)
+        self.lbl_alert.setStyleSheet("background:#dc2626; color:white; font-size:14px; font-weight:bold; padding:10px;")
+        self.lbl_alert.hide()
+        self._alert_timer = QtCore.QTimer(self)
+        self._alert_timer.setSingleShot(True)
+        self._alert_timer.timeout.connect(self.lbl_alert.hide)
+        side.addWidget(self.lbl_alert)
         self.lbl_count = QtWidgets.QLabel("No session running")
         self.lbl_count.setStyleSheet("font-size: 15px; font-weight: bold;")
         side.addWidget(self.lbl_count)
@@ -474,9 +472,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ed_search.textChanged.connect(self._filter_students)
         btn_re = QtWidgets.QPushButton("Re-enroll selected")
         btn_rm = QtWidgets.QPushButton("Remove selected")
+        btn_up = QtWidgets.QPushButton("Update look (add samples)")
+        btn_up.setToolTip("Student changed appearance (glasses, beard, hair...)? Adds a few new samples in "
+                          "about 20 seconds, without deleting the original enrollment.")
+        btn_up.clicked.connect(self.update_look_selected)
         btn_re.clicked.connect(self.reenroll_selected)
         btn_rm.clicked.connect(self.remove_selected)
         row.addWidget(self.ed_search, 1)
+        row.addWidget(btn_up)
         row.addWidget(btn_re)
         row.addWidget(btn_rm)
         layout.addLayout(row)
@@ -525,7 +528,6 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.frame_ready.connect(self._on_frame)
         worker.identity_confirmed.connect(self._on_identity)
         worker.spoof_detected.connect(self._on_spoof)
-        worker.antispoof_problem.connect(self._on_antispoof_problem)
         worker.enroll_finished.connect(self._on_enroll_finished)
         worker.status.connect(self.lbl_status.setText)
         worker.failed.connect(self._on_worker_failed)
@@ -597,26 +599,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._enroll_ctx is not None:
             QtWidgets.QMessageBox.warning(self, "Busy", "Finish or cancel the enrollment first.")
             return
-        live_only = self.cmb_mode.currentData() == "live"
-        if not live_only:
-            if not self.gate.ensure(self):
-                return
-            answer = QtWidgets.QMessageBox.question(
-                self, "Photo attendance",
-                "In PHOTO mode a photo, printout or phone screen shown to the camera WILL mark that "
-                "person present. Attendance is recorded as 'face-photo' so it can be told apart in reports.\n\n"
-                "Use LIVE mode for real classes. Start photo mode anyway?")
-            if answer != QtWidgets.QMessageBox.Yes:
-                return
         self.start_camera()
         self.session_deadline = self.time_late.time().toString("HH:mm") + ":00"
         self.session_id = self.db.get_or_create_session(subject, date.today().isoformat(), self.session_deadline)
         marked = self.db.marked_set(self.session_id)
-        self.session_method = "face" if live_only else "face-photo"
-        self._spoof_count = 0
-        if not live_only:
-            self.db.audit("photo-mode-session", subject, f"session {self.session_id} started in photo mode")
-        self.worker.begin_session(marked, live_only)
+        self.worker.begin_session(marked)
         rows = self.db.session_rows(self.session_id)
         fill_table(self.tbl_live, ["Reg No", "Name", "Time", "Status", "Method"],
                    [[r["reg_no"], r["name"], r["marked_at"][11:], r["status"], r["method"]] for r in rows])
@@ -624,8 +611,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_start.setEnabled(False)
         self.btn_end.setEnabled(True)
         self.cmb_subject.setEnabled(False)
-        self.cmb_mode.setEnabled(False)
-        self.lbl_alert.hide()
         self.refresh_subjects()
         self.cmb_subject.setEditText(subject)
 
@@ -640,8 +625,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_start.setEnabled(True)
         self.btn_end.setEnabled(False)
         self.cmb_subject.setEnabled(True)
-        self.cmb_mode.setEnabled(True)
-        self.lbl_alert.hide()
         self.lbl_count.setText("No session running")
         if ask_export:
             answer = QtWidgets.QMessageBox.question(
@@ -662,51 +645,41 @@ class MainWindow(QtWidgets.QMainWindow):
     def _status_for_now(self) -> str:
         return "Present" if datetime.now().strftime("%H:%M:%S") <= self.session_deadline else "Late"
 
-    def _on_identity(self, reg_no: str, score: float) -> None:
+    def _on_identity(self, reg_no: str, score: float, embedding) -> None:
         if self.session_id is None:
             return
         status = self._status_for_now()
-        if self.db.mark_attendance(self.session_id, reg_no, status, self.session_method, score):
-            self._append_live_row(reg_no, status, self.session_method)
+        if self.db.mark_attendance(self.session_id, reg_no, status, "face", score):
+            self._append_live_row(reg_no, status, "face")
             QtWidgets.QApplication.beep()
             name = self.gallery.names.get(reg_no, "")
             self.statusBar().showMessage(f"Marked {name} ({reg_no}) - {status}", 6000)
+        self._adapt(reg_no, score, embedding)
 
-    def _on_spoof(self, reg_no: str, label: str, score: float) -> None:
-        """A photo/screen was held up: show a red warning naming the person, beep, and keep an audit trail."""
-        if self.session_id is None:
-            return
-        self._spoof_count += 1
-        if label:
-            text = f"WARNING - PHOTO DETECTED\nA photo of {label} is being shown to the camera.\nAttendance NOT marked."
+    def _adapt(self, reg_no: str, score: float, embedding) -> None:
+        """Learn a changed look right away - only after a confident, LIVE-verified match."""
+        try:
+            if adaptive_template_ok(self.gallery, reg_no, embedding, score):
+                self.db.add_templates(reg_no, [embedding], config.EMBEDDING_MODEL_TAG, "auto")
+                self.reload_gallery()          # the very next frames already use the new template
+                log.info("Learned a new look for %s (score %.2f)", reg_no, score)
+        except Exception:
+            log.exception("Adaptive template update failed")
+
+    def _on_spoof(self, kind: str, reg_no: str, message: str) -> None:
+        name = self.gallery.names.get(reg_no, "")
+        if kind == "photo":
+            banner = (f"\u26a0 PHOTO DETECTED\nA photo of {name} ({reg_no}) is being shown to the camera.\n"
+                      f"Attendance NOT marked.")
         else:
-            text = "WARNING - PHOTO / SCREEN DETECTED\nA picture is being shown to the camera.\nAttendance NOT marked."
-        self.lbl_alert.setText(text)
+            banner = (f"\u26a0 LIVENESS FAILED\nNo live movement from {name} ({reg_no}) - possibly a photo.\n"
+                      f"Attendance NOT marked. A real student can simply try again and follow the prompts.")
+        self.lbl_alert.setText(banner)
         self.lbl_alert.show()
-        self._alert_timer.start(8000)
+        self._alert_timer.start(10000)
+        self.statusBar().showMessage(message, 10000)
         QtWidgets.QApplication.beep()
-        self.statusBar().showMessage(text.replace("\n", " "), 8000)
-        self.db.audit("spoof-attempt", reg_no,
-                      f"photo/screen shown in session {self.session_id} (live score {score:.2f})")
-        self._update_count()
-
-    def _on_antispoof_problem(self, message: str) -> None:
-        QtWidgets.QMessageBox.warning(
-            self, "Photo detector unavailable",
-            f"{message}\n\nLive attendance is PAUSED until the photo detector is available "
-            f"(config.ANTISPOOF_REQUIRED). Enrollment and photo mode still work.")
-
-    def _update_mode_hint(self) -> None:
-        if self.cmb_mode.currentData() == "live":
-            self.lbl_mode_hint.setText(
-                "Only a physically present person counts. Photos, printouts and phone screens are rejected "
-                "with a warning, and each student is asked to turn their head.")
-            self.lbl_mode_hint.setStyleSheet("color:#15803d;")
-        else:
-            self.lbl_mode_hint.setText(
-                "Anything recognised is marked, INCLUDING a photo. Needs the admin password. "
-                "Recorded as 'face-photo'.")
-            self.lbl_mode_hint.setStyleSheet("color:#b45309;")
+        self.db.audit("spoof-photo" if kind == "photo" else "spoof-no-liveness", reg_no, message)
 
     def _append_live_row(self, reg_no: str, status: str, method: str) -> None:
         name = self.gallery.names.get(reg_no) or (self.db.get_student(reg_no) or {"name": ""})["name"]
@@ -725,10 +698,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_count(self) -> None:
         if self.session_id is not None:
             marked, enrolled = self.db.session_counts(self.session_id)
-            text = f"Marked {marked} of {enrolled} enrolled"
-            if self._spoof_count:
-                text += f"  |  photo attempts blocked: {self._spoof_count}"
-            self.lbl_count.setText(text)
+            self.lbl_count.setText(f"Marked {marked} of {enrolled} enrolled")
 
     def manual_mark(self) -> None:
         if self.session_id is None:
@@ -784,10 +754,36 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.start_camera()
         self._enroll_ctx = {"reg_no": reg_no, "name": name, "dept": self.ed_dept.text().strip(),
-                            "section": self.ed_section.text().strip(), "replace": replace}
+                            "section": self.ed_section.text().strip(), "replace": replace, "append": False}
         self.worker.begin_enrollment()
         self.btn_enroll_start.setEnabled(False)
         self.btn_enroll_cancel.setEnabled(True)
+
+    def update_look_selected(self) -> None:
+        """Quick, admin-confirmed update when a student's appearance changed: ADDS samples."""
+        reg_no = self._selected_reg()
+        student = self.db.get_student(reg_no) if reg_no else None
+        if not student:
+            return
+        if self.session_id is not None:
+            QtWidgets.QMessageBox.warning(
+                self, "Session running",
+                "End the attendance session first (starting the same subject again later today continues "
+                "the same session, nothing is lost).")
+            return
+        if not self.gate.ensure(self):
+            return
+        QtWidgets.QMessageBox.information(
+            self, "Update look",
+            f"{student['name']} ({student['reg_no']}) will be shown the same prompts as enrollment "
+            f"(4 samples, about 20 seconds). The student must be physically present.")
+        self.start_camera()
+        self._enroll_ctx = {"reg_no": reg_no, "name": student["name"], "dept": student["department"],
+                            "section": student["section"], "replace": False, "append": True}
+        self.worker.begin_enrollment(config.UPDATE_PROMPTS)
+        self.btn_enroll_start.setEnabled(False)
+        self.btn_enroll_cancel.setEnabled(True)
+        self.tabs.setCurrentIndex(1)
 
     def cancel_enrollment(self) -> None:
         if self.worker is not None and self._enroll_ctx is not None:
@@ -811,6 +807,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"This face closely matches {who} ({other[0]}), who is already enrolled under another Reg No "
                 f"(similarity {other[1]:.2f}).\n\nNothing was saved. If this is a different person "
                 f"(e.g. a twin), an administrator can raise DUPLICATE_THRESHOLD in config.py.")
+            return
+        if ctx.get("append"):
+            try:
+                self.db.add_templates(ctx["reg_no"], result.vectors, config.EMBEDDING_MODEL_TAG, "update")
+            except ValueError as exc:
+                QtWidgets.QMessageBox.critical(self, "Could not save", str(exc))
+                return
+            if config.SAVE_FACE_IMAGES:
+                folder = student_dir(ctx["reg_no"])
+                folder.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                for i, crop in enumerate(result.crops, 1):
+                    cv2.imwrite(str(folder / f"upd_{stamp}_{i:02d}.png"), crop)
+            self.reload_gallery()
+            self.refresh_students()
+            QtWidgets.QMessageBox.information(
+                self, "Look updated",
+                f"{ctx['name']} ({ctx['reg_no']}): {len(result.vectors)} new samples added. "
+                f"The new appearance is recognised immediately.")
             return
         try:
             self.db.save_enrollment(ctx["reg_no"], ctx["name"], ctx["dept"], ctx["section"],

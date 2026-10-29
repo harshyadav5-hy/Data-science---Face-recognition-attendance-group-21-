@@ -1,25 +1,23 @@
 """Per-frame logic with no Qt and no camera, so it can be unit-tested.
 
-* AttendanceProcessor - tracks faces across frames and marks a student only when
-    1. the face is recognised (several agreeing frames),
-    2. LIVE mode: it is a real person - not a photo/screen (passive detector) - who also passes a
-       random head-turn challenge measured with a photo-proof cue (face_engine.face_turn),
-    3. it is still the same face that was recognised (face-swap detection resets the track at once).
-  PHOTO mode (admin option) skips step 2.
+* AttendanceProcessor - tracks faces across frames, identifies them from several agreeing frames
+  (quality-gated, multi-frame fused), then REQUIRES a live 3-D head-turn challenge before the
+  attendance is reported. A photo / flat picture never passes: it is flagged and the person it
+  shows is named in a warning. Already-marked faces are re-checked, so a swap is noticed fast.
 * EnrollmentSession   - guided capture of varied, sharp, well-lit samples for one person.
 """
 from __future__ import annotations
 
-import random
 import time
-from collections import Counter, deque
+from collections import Counter, deque, namedtuple
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 
 import config
-from face_engine import Gallery, face_turn, head_yaw, image_quality
+from face_engine import Gallery, face_frame, head_yaw, image_quality
+from liveness import LivenessChallenge
 
 # Overlay = (x, y, w, h, text, "#rrggbb") in raw camera coordinates.
 COL_OK = "#22c55e"
@@ -27,19 +25,13 @@ COL_WAIT = "#eab308"
 COL_BAD = "#ef4444"
 COL_CHALLENGE = "#f97316"
 COL_DIM = "#9ca3af"
-COL_PHOTO = "#ff1f6e"
-BANNER_SECONDS = 6.0
+
+# kind: "photo" (strong evidence) | "timeout" (no live movement -> possible photo)
+SpoofAlert = namedtuple("SpoofAlert", "kind reg_no text box")
 
 
 def _box(face: np.ndarray) -> tuple[float, float, float, float]:
     return float(face[0]), float(face[1]), float(face[2]), float(face[3])
-
-
-@dataclass(frozen=True)
-class SpoofAlert:
-    reg_no: Optional[str]    # whose photo it is, when the face was recognised
-    label: str               # "Name (REG)" or "" when unknown
-    score: float             # mean live-probability that triggered the alert
 
 
 # ======================================================================= attendance
@@ -49,68 +41,58 @@ class Track:
     def __init__(self, face: np.ndarray, now: float):
         Track._counter += 1
         self.id = Track._counter
-        self.reset_identity()
-        self.update_geometry(face, now)
-
-    def reset_identity(self) -> None:
-        """Forget everything learned about the face in this box (a different face appeared)."""
-        self.history: deque = deque(maxlen=config.CONFIRM_WINDOW)    # (reg_no | None, score)
-        self.embeddings: deque = deque(maxlen=4)                      # recent embeddings: continuity check
-        self.swap_strikes = 0
-        self.real_hist: deque = deque(maxlen=config.ANTISPOOF_WINDOW)  # live-probabilities
-        self.verdict = "checking"                                     # checking | real | photo
-        self.photo_since: Optional[float] = None
-        self.named: Optional[str] = None                              # last confirmed identity
+        self.history: deque = deque(maxlen=config.CONFIRM_WINDOW)   # (reg_no | None, score)
+        self.embs: deque = deque(maxlen=config.FUSE_FRAMES)
+        self.near: deque = deque(maxlen=config.NEAR_MISS_FRAMES)    # (reg_no | None, score)
+        self.identity: Optional[str] = None
+        self.score = 0.0
+        self.fused: Optional[np.ndarray] = None
         self.marked = False
-        self.marked_reg: Optional[str] = None
-        self.reset_challenge()
-
-    def reset_challenge(self) -> None:
-        self.steps: Optional[list] = None
-        self.step_idx = 0
-        self.front_run = 0
-        self.hold = 0
-        self.armed = False
-        self.challenge_t0: Optional[float] = None
-        self.challenge_for: Optional[str] = None
-        self.done = False
+        self.challenge: Optional[LivenessChallenge] = None
+        self.verifying = False
+        self.verify_deadline = 0.0
+        self.spoof_until = 0.0
+        self.spoof_text = ""
+        self.last_check = 0.0
+        self.recheck_misses = 0
+        self.update_geometry(face, now)
 
     def update_geometry(self, face: np.ndarray, now: float) -> None:
         x, y, w, h = _box(face)
         self.cx, self.cy, self.w = x + w / 2, y + h / 2, w
         self.last_seen = now
 
+    def reset_liveness(self) -> None:
+        self.challenge = None
+        self.verifying = False
+
+    def reset_identity(self) -> None:
+        self.history.clear()
+        self.embs.clear()
+        self.near.clear()
+        self.identity = None
+        self.score = 0.0
+        self.fused = None
+        self.marked = False
+        self.recheck_misses = 0
+        self.reset_liveness()
+
 
 class AttendanceProcessor:
-    """require_liveness=True  -> LIVE mode (photos/screens rejected, head-turn challenge).
-    require_liveness=False -> PHOTO mode (anything recognised is marked; admin option).
-    antispoof_required=True makes LIVE mode refuse to mark anything while the photo detector is missing."""
-
-    def __init__(self, engine, gallery: Gallery, already_marked: set[str], require_liveness: bool = True,
-                 antispoof=None, antispoof_required: bool = False, rng: Optional[random.Random] = None):
+    def __init__(self, engine, gallery: Gallery, already_marked: set[str]):
         self.engine = engine
         self.gallery = gallery
         self.marked = set(already_marked)
-        self.require_liveness = require_liveness
-        self.antispoof = antispoof
-        self.antispoof_required = antispoof_required
-        self.rng = rng or random.Random()
         self.tracks: list[Track] = []
-        self.alerts: list[SpoofAlert] = []
-        self.photo_attempts = 0
-        self._alert_last: dict[str, float] = {}
-        self._banner: Optional[tuple[str, float]] = None
-
-    # ------------------------------------------------------------------ helpers
-    def _label(self, reg_no: Optional[str]) -> str:
-        if not reg_no:
-            return ""
-        name = self.gallery.names.get(reg_no)
-        return f"{name} ({reg_no})" if name else reg_no
+        self._alerts: list[SpoofAlert] = []
 
     def pop_alerts(self) -> list[SpoofAlert]:
-        alerts, self.alerts = self.alerts, []
+        alerts, self._alerts = self._alerts, []
         return alerts
+
+    def _label(self, reg_no: str) -> str:
+        name = self.gallery.names.get(reg_no)
+        return f"{name} ({reg_no})" if name else reg_no
 
     def _assign(self, faces: np.ndarray, now: float) -> dict[int, Track]:
         """Greedy nearest-centre matching of detections to existing tracks."""
@@ -135,206 +117,198 @@ class AttendanceProcessor:
         self.tracks = [t for t in self.tracks if now - t.last_seen <= config.TRACK_TTL]
         return assigned
 
-    # ------------------------------------------------------------------ face-swap detection
-    def _check_swap(self, track: Track, emb: np.ndarray) -> str:
-        """Compare this frame's face with the recent frames of the same box.
-        'ok'    - same face;  'skip' - suspicious frame (ignored, could be blur);
-        'reset' - the face really changed: the track was wiped and starts again from this frame."""
-        state = "ok"
-        if track.embeddings:
-            ref = np.mean(track.embeddings, axis=0)
-            norm = float(np.linalg.norm(ref))
-            sim = float(emb @ ref) / norm if norm > 0 else 1.0
-            if sim < config.SWAP_SIMILARITY:
-                track.swap_strikes += 1
-                if track.swap_strikes < config.SWAP_FRAMES:
-                    return "skip"
-                track.reset_identity()
-                state = "reset"
-            else:
-                track.swap_strikes = 0
-        track.embeddings.append(emb)
-        return state
+    # ------------------------------------------------------------------ recognition
+    @staticmethod
+    def _good_quality(aligned: np.ndarray) -> bool:
+        sharpness, brightness = image_quality(aligned)
+        return (sharpness >= config.RECOG_MIN_SHARPNESS
+                and config.RECOG_MIN_BRIGHT <= brightness <= config.RECOG_MAX_BRIGHT)
 
-    def _current_identity(self, track: Track) -> tuple[Optional[str], float]:
-        """Identity backed by enough of the recent frames (recomputed every frame, never sticky)."""
-        votes = Counter(reg for reg, _ in track.history if reg)
-        if not votes:
-            return None, 0.0
-        reg, count = votes.most_common(1)[0]
-        if count < config.CONFIRM_FRAMES:
-            return None, 0.0
-        return reg, float(np.mean([s for r, s in track.history if r == reg]))
-
-    # ------------------------------------------------------------------ passive photo / screen verdict
-    def _update_verdict(self, track: Track, frame: np.ndarray, face: np.ndarray) -> Optional[float]:
-        if self.antispoof is None:
-            track.verdict = "real"          # only reachable when ANTISPOOF_REQUIRED is off (challenge-only)
+    @staticmethod
+    def _fused(track: Track) -> Optional[np.ndarray]:
+        if len(track.embs) < config.FUSE_MIN:
             return None
-        track.real_hist.append(float(self.antispoof.real_probability(frame, face)))
-        mean = float(np.mean(track.real_hist))
-        if len(track.real_hist) >= config.ANTISPOOF_MIN_FRAMES:
-            if mean >= config.ANTISPOOF_REAL_THRESHOLD:
-                track.verdict = "real"
-            elif mean < config.ANTISPOOF_REAL_THRESHOLD - config.ANTISPOOF_HYSTERESIS:
-                track.verdict = "photo"
-            # in between: keep the previous verdict (hysteresis stops flicker)
-        return mean
+        vec = np.mean(np.asarray(track.embs, np.float32), axis=0)
+        norm = float(np.linalg.norm(vec))
+        return vec / norm if norm > 0 else None
 
-    def _flag_photo(self, track: Track, now: float, mean: Optional[float]) -> str:
-        """Block the face, restart its challenge, and raise one rate-limited warning."""
-        if track.photo_since is None:
-            track.photo_since = now
-        track.reset_challenge()
-        who = track.named
-        key = who or "?"
-        ready = who is not None or now - track.photo_since >= 1.0   # wait briefly so the name is known
-        if ready and now - self._alert_last.get(key, -1e9) >= config.ANTISPOOF_ALERT_COOLDOWN:
-            self._alert_last[key] = now
-            self.photo_attempts += 1
-            self.alerts.append(SpoofAlert(who, self._label(who), float(mean if mean is not None else 0.0)))
-            text = (f"WARNING: photo of {self._label(who)} shown - NOT marked" if who
-                    else "WARNING: photo / screen shown - NOT marked")
-            self._banner = (text, now + BANNER_SECONDS)
-        if who:
-            return f"PHOTO of {self._label(who)} - NOT MARKED"
-        return "PHOTO / SCREEN DETECTED - NOT MARKED"
+    def _identify(self, track: Track, frame: np.ndarray, face: np.ndarray, frontal: bool) -> str:
+        """Adds one vote for this frame. Returns 'ok' | 'turned' | 'quality'."""
+        if not frontal:
+            return "turned"                      # too far turned to identify reliably
+        aligned = self.engine.align(frame, face)
+        if not self._good_quality(aligned):
+            return "quality"
+        emb = self.engine.embed_aligned(aligned)
+        result = self.gallery.match(emb)
+        track.history.append((result.reg_no if result.accepted else None, result.score))
+        track.embs.append(emb)
+        track.near.append((None, 0.0) if result.accepted else (result.reg_no, result.score))
+        self._update_identity(track)
+        return "ok"
 
-    # ------------------------------------------------------------------ head-turn challenge
-    def _challenge(self, track: Track, face: np.ndarray, reg: Optional[str], now: float) -> tuple[bool, str]:
-        """Random left/right head-turn. Uses face_turn(), which a flat photo cannot change however
-        it is tilted or moved. Returns (finished, prompt)."""
-        if reg is not None and track.challenge_for not in (None, reg):
-            track.reset_challenge()                                  # a different person: start over
-        if track.steps is None:
-            if reg is None:
-                return False, "Look at the camera"
-            order = ["left", "right"]
-            self.rng.shuffle(order)
-            track.steps = order[:max(1, min(2, config.LIVENESS_STEPS))]
-            track.challenge_for = reg
-            track.challenge_t0 = now
-        elif now - track.challenge_t0 > config.LIVENESS_TIMEOUT:
-            track.reset_challenge()
-            return False, "Time is up - look at the camera, then try again"
+    def _update_identity(self, track: Track) -> None:
+        votes = Counter(reg for reg, _ in track.history if reg)
+        if votes:
+            reg, count = votes.most_common(1)[0]
+            if count >= config.CONFIRM_FRAMES:
+                fused = self._fused(track)
+                fres = self.gallery.match(fused) if fused is not None else None
+                if fres is None or (fres.accepted and fres.reg_no == reg):
+                    if reg != track.identity:        # a different person: start from scratch
+                        track.identity = reg
+                        track.reset_liveness()
+                    track.score = float(np.mean([s for r, s in track.history if r == reg]))
+                    track.fused = fused
+                    return
+        recent = list(track.history)[-config.LOSE_FRAMES:]
+        if (track.identity and len(recent) >= config.LOSE_FRAMES
+                and all(r != track.identity for r, _ in recent)):
+            track.identity = None                    # face changed / person left: withdraw label
+            track.fused = None
+            track.reset_liveness()
 
-        turn = face_turn(face)
-        if not track.armed:                                          # must be seen facing the camera first
-            track.front_run = track.front_run + 1 if abs(turn) <= config.LIVENESS_FRONT_MAX else 0
-            if track.front_run < 2:
-                return False, "Look straight at the camera"
-            track.armed = True
+    def _recheck_marked(self, track: Track, frame: np.ndarray, face: np.ndarray,
+                        frontal: bool, now: float) -> None:
+        """Already-marked faces are verified again every RECHECK_INTERVAL seconds."""
+        if not frontal or now - track.last_check < config.RECHECK_INTERVAL:
+            return
+        track.last_check = now
+        aligned = self.engine.align(frame, face)
+        if not self._good_quality(aligned):
+            return
+        result = self.gallery.match(self.engine.embed_aligned(aligned))
+        if result.accepted and result.reg_no == track.identity:
+            track.recheck_misses = 0
+            return
+        track.recheck_misses += 1
+        other_person = result.accepted and result.reg_no != track.identity
+        if other_person or track.recheck_misses >= config.RECHECK_MISSES:
+            track.reset_identity()                   # someone else sat down / face changed a lot
 
-        sign = 1.0 if track.steps[track.step_idx] == "left" else -1.0   # camera-right (+) = person's left
-        if config.LIVENESS_TURN_MIN <= turn * sign <= config.LIVENESS_TURN_MAX:
-            track.hold += 1
-        else:
-            track.hold = 0
-        if track.hold >= config.LIVENESS_HOLD_FRAMES:
-            track.step_idx += 1
-            track.hold = 0
-            if track.step_idx >= len(track.steps):
-                track.done = True
-                return True, ""
-        side = track.steps[track.step_idx].upper()
-        return False, (f"Slowly turn your head to your {side}" if track.step_idx == 0
-                       else f"Good - now turn to your {side}")
+    @staticmethod
+    def _near_miss(track: Track) -> bool:
+        if len(track.near) < config.NEAR_MISS_FRAMES:
+            return False
+        regs = {r for r, _ in track.near}
+        return None not in regs and len(regs) == 1 and min(s for _, s in track.near) >= config.NEAR_MISS_MIN
 
-    # ------------------------------------------------------------------ per frame
+    # ------------------------------------------------------------------ per-frame
     def process(self, frame: np.ndarray, faces: np.ndarray, now: Optional[float] = None):
-        """Returns (overlays, events, hud). events = [(reg_no, score)] to record - once each."""
+        """Returns (overlays, events, hud).
+        events = [(reg_no, score, fused_embedding)] - reported once per person, only after liveness.
+        Spoof alerts are collected separately: see pop_alerts()."""
         now = time.monotonic() if now is None else now
-        live = self.require_liveness
-        if live and self.antispoof_required and self.antispoof is None:
-            return ([(*_box(f), "Photo check unavailable", COL_BAD) for f in faces], [],
-                    ["Photo detector not loaded - attendance PAUSED"])
-
         height, width = frame.shape[:2]
         assigned = self._assign(faces, now)
         overlays: list[tuple] = []
-        events: list[tuple[str, float]] = []
+        events: list[tuple] = []
 
         for i, face in enumerate(faces):
             track = assigned[i]
-            x, y, fw, fh = box = _box(face)
+            box = _box(face)
+            x, y, fw, fh = box
+
             cut_off = (x < -0.05 * fw or y < -0.05 * fh
                        or x + fw > width + 0.05 * fw or y + fh > height + 0.05 * fh)
             if fw < config.MIN_FACE_PX or cut_off:
                 overlays.append((*box, "Come closer / centre your face", COL_DIM))
                 continue
 
-            emb = self.engine.embed_aligned(self.engine.align(frame, face))
-            if self._check_swap(track, emb) == "skip":
-                overlays.append((*box, "Verifying...", COL_WAIT))
-                continue
-
-            result = self.gallery.match(emb)
-            track.history.append((result.reg_no if result.accepted else None, result.score))
-            reg, score = self._current_identity(track)
-            if reg:
-                track.named = reg
-            if track.marked and reg and reg != track.marked_reg:      # someone else is now in this box
-                track.reset_identity()
-                track.history.append((result.reg_no if result.accepted else None, result.score))
-                track.embeddings.append(emb)
-                reg, score = None, 0.0
-            debug = f"  [sim {result.score:.2f}]" if config.SHOW_DEBUG_SCORES else ""
+            geom = face_frame(face)
+            frontal = geom is not None and abs(geom[0]) <= config.RECOG_MAX_YAW
 
             if track.marked:
-                overlays.append((*box, f"\u2713 {self._label(track.marked_reg)}{debug}", COL_OK))
+                self._recheck_marked(track, frame, face, frontal, now)
+                if track.marked:
+                    overlays.append((*box, f"\u2713 {self._label(track.identity)}", COL_OK))
+                    continue
+
+            if now < track.spoof_until:
+                overlays.append((*box, track.spoof_text, COL_BAD))
                 continue
 
-            # ---- LIVE mode: is this a real, present person?
-            mean_real = None
-            if live:
-                mean_real = self._update_verdict(track, frame, face)
-                if config.SHOW_DEBUG_SCORES and mean_real is not None:
-                    debug += f" [live {mean_real:.2f}]"
-                if track.verdict == "photo":
-                    overlays.append((*box, self._flag_photo(track, now, mean_real) + debug, COL_PHOTO))
-                    continue
-                track.photo_since = None
+            status = self._identify(track, frame, face, frontal)
 
-            target = reg or track.challenge_for
-            if target is None:
-                if any(r for r, _ in track.history):
-                    overlays.append((*box, f"Identifying...{debug}", COL_WAIT))
+            if track.identity is None:
+                if any(reg for reg, _ in track.history):
+                    overlays.append((*box, "Identifying...", COL_WAIT))
+                elif self._near_miss(track):
+                    overlays.append((*box, "Not recognised - face changed? Ask admin: Update look", COL_BAD))
                 elif len(track.history) >= 3:
-                    overlays.append((*box, f"Unknown{debug}", COL_BAD))
+                    overlays.append((*box, "Unknown", COL_BAD))
+                elif status == "turned":
+                    overlays.append((*box, "Face the camera", COL_WAIT))
+                elif status == "quality":
+                    overlays.append((*box, "Hold still / improve lighting", COL_WAIT))
                 else:
-                    overlays.append((*box, f"Scanning...{debug}", COL_WAIT))
+                    overlays.append((*box, "Scanning...", COL_WAIT))
                 continue
 
-            if reg and reg in self.marked:                            # marked via another track / earlier
-                track.marked, track.marked_reg = True, reg
-                overlays.append((*box, f"\u2713 {self._label(reg)} (already marked)", COL_OK))
+            reg_no = track.identity
+            label = self._label(reg_no)
+            if reg_no in self.marked:                       # marked via another track / earlier
+                track.marked = True
+                track.last_check = now
+                overlays.append((*box, f"\u2713 {label} (already marked)", COL_OK))
                 continue
 
-            if live:
-                if track.verdict != "real":
-                    overlays.append((*box, f"Checking you are live...{debug}", COL_WAIT))
-                    continue
-                if not track.done:
-                    _, prompt = self._challenge(track, face, reg, now)
-                    overlays.append((*box, f"{self._label(target)}: {prompt}{debug}", COL_CHALLENGE))
-                    continue
-                if reg != track.challenge_for:                        # finished turning - re-confirm identity
-                    overlays.append((*box, f"{self._label(target)}: look at the camera{debug}", COL_WAIT))
-                    continue
+            # ---- mandatory liveness challenge (never skipped)
+            if track.challenge is None:
+                track.challenge = LivenessChallenge(now)
+                track.verifying = False
+            verdict = track.challenge.update(geom, now)
+            debug = f"  [{verdict.debug}]" if verdict.debug else ""
 
-            # ---- all checks passed
-            self.marked.add(reg)
-            track.marked, track.marked_reg = True, reg
-            events.append((reg, score))
-            overlays.append((*box, f"\u2713 {self._label(reg)}{debug}", COL_OK))
+            if verdict.state == "running":
+                if verdict.stage == "verify" and not track.verifying:
+                    track.verifying = True               # identity must be re-confirmed afterwards
+                    track.history.clear()
+                    track.embs.clear()
+                    track.verify_deadline = now + config.VERIFY_TIMEOUT
+                overlays.append((*box, f"{label}: {verdict.prompt}{debug}", COL_CHALLENGE))
 
-        hud = ["LIVE mode - photos and screens rejected" if live else "PHOTO mode - photos are accepted",
-               f"Marked this session: {len(self.marked)}"]
-        if self.photo_attempts:
-            hud.append(f"Photo attempts blocked: {self.photo_attempts}")
-        if self._banner and now < self._banner[1]:
-            hud.insert(0, self._banner[0])
+            elif verdict.state == "passed":
+                confirmed = Counter(r for r, _ in track.history if r).get(reg_no, 0) >= config.CONFIRM_FRAMES
+                if confirmed and track.identity == reg_no:
+                    self.marked.add(reg_no)
+                    track.marked = True
+                    track.last_check = now
+                    track.recheck_misses = 0
+                    events.append((reg_no, track.score, track.fused))
+                    overlays.append((*box, f"\u2713 {label}", COL_OK))
+                else:
+                    if now > track.verify_deadline:
+                        track.reset_liveness()           # could not re-confirm: run a fresh challenge
+                    overlays.append((*box, f"{label}: verifying...", COL_WAIT))
+
+            else:                                        # "photo" or "timeout"
+                if verdict.state == "photo":
+                    text = f"PHOTO of {label} shown - NOT MARKED"
+                else:
+                    text = f"No live movement - possible PHOTO of {label} - NOT MARKED"
+                track.spoof_text = text
+                track.spoof_until = now + config.SPOOF_RED_SECONDS
+                track.reset_liveness()
+                self._alerts.append(SpoofAlert(verdict.state, reg_no, text, box))
+                overlays.append((*box, text, COL_BAD))
+
+        hud = [f"Marked this session: {len(self.marked)}", "Anti-photo liveness check: ON"]
         return overlays, events, hud
+
+
+def adaptive_template_ok(gallery: Gallery, reg_no: str, embedding, score: float) -> bool:
+    """Should this live-verified match be learned as a new template for `reg_no`?
+    Only confident matches that show a genuinely NEW view (glasses, beard, light...) and are not
+    ambiguous with another student."""
+    if not config.ADAPT_ENABLED or embedding is None or reg_no not in gallery.ids:
+        return False
+    if score < config.ADAPT_MIN_SCORE:
+        return False
+    if gallery.identity_score(reg_no, embedding, topk=1) >= config.ADAPT_MAX_SIMILARITY:
+        return False
+    other = gallery.best_other([embedding], exclude=reg_no)
+    return other is None or other[1] < config.ADAPT_MAX_OTHER
 
 
 # ======================================================================= enrolment

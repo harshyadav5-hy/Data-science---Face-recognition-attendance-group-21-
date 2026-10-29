@@ -5,7 +5,6 @@ and recognising means a nearest-neighbour search against them.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import shutil
@@ -70,83 +69,40 @@ def ensure_models(progress: Optional[Callable[[str], None]] = None) -> tuple[Pat
     return paths[0], paths[1]
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _model_ok(path: Path, spec: dict) -> bool:
-    """File exists, is big enough and (when a hash is pinned) is byte-for-byte the tested model."""
-    if not (path.exists() and path.stat().st_size >= spec["min_bytes"]):
-        return False
-    expected = spec.get("sha256")
-    return not expected or _sha256(path) == expected
-
-
-def ensure_antispoof_models(progress: Optional[Callable[[str], None]] = None) -> list[tuple[Path, float]]:
-    """[(model_path, crop_scale), ...] for the photo/screen detector, downloading on first use.
-
-    The files are verified against the SHA-256 pinned in config.py: this is a security component,
-    so a corrupted or swapped model is refused instead of silently trusted.
-    """
-    config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    result = []
-    for spec in config.ANTISPOOF_MODELS:
-        path = config.MODELS_DIR / spec["file"]
-        if not _model_ok(path, spec):
-            path.unlink(missing_ok=True)
-            _download(spec, path, progress)
-            if not _model_ok(path, spec):
-                path.unlink(missing_ok=True)
-                raise ModelError(
-                    f"{spec['file']} does not match the checksum pinned in config.py, so it was rejected.\n"
-                    f"Download the original from:\n" + "\n".join(spec["urls"]))
-        result.append((path, float(spec["scale"])))
-    return result
-
-
 # ---------------------------------------------------------------- geometry helpers
+def face_frame(face: np.ndarray) -> Optional[tuple[float, float, float]]:
+    """Nose position in the face's OWN coordinate frame: (u, v, r), or None if degenerate.
+
+    The frame is built from the eyes and mouth: origin = mid-eyes, x-axis = eye-to-eye vector,
+    y-axis = mid-eyes -> mid-mouth. The nose is then expressed as  nose = origin + u*x + v*y.
+    * u ~ 0 when facing the camera. u > 0 = nose towards the right of the *camera* image
+      (the person's LEFT). It measures head yaw.
+    * For a FLAT picture, (u, v) are constant however the picture is moved, rolled, scaled or
+      tilted (an affine map keeps these coordinates). Only a real 3-D head changes u when it turns.
+    * r = eye distance / eye-to-mouth distance. It shrinks when a face turns away (foreshortening)
+      - for a real head together with a change of u, for a tilted flat picture WITHOUT one.
+    """
+    pts = np.asarray(face[4:14], dtype=np.float32).reshape(5, 2)
+    eyes = pts[:2][np.argsort(pts[:2, 0])]          # independent of the detector's left/right labels
+    nose = pts[2]
+    origin = eyes.mean(axis=0)
+    ex = eyes[1] - eyes[0]
+    ey = pts[3:5].mean(axis=0) - origin
+    ex_len, ey_len = float(np.hypot(*ex)), float(np.hypot(*ey))
+    det = float(ex[0] * ey[1] - ex[1] * ey[0])
+    if ex_len < 1e-3 or ey_len < 1e-3 or abs(det) < 0.2 * ex_len * ey_len:
+        return None
+    d = nose - origin
+    u = float(d[0] * ey[1] - d[1] * ey[0]) / det
+    v = float(ex[0] * d[1] - ex[1] * d[0]) / det
+    return u, v, ex_len / ey_len
+
+
 def head_yaw(face: np.ndarray) -> float:
-    """Horizontal nose offset divided by inter-eye distance, in raw camera coordinates.
-
-    ~0 when facing the camera. Positive = nose towards the right of the *camera* image,
-    which is the person's LEFT. Sorting the eyes by x makes this independent of the
-    detector's left/right landmark labelling.
-    """
-    pts = np.asarray(face[4:14], dtype=np.float32).reshape(5, 2)
-    eyes = pts[:2][np.argsort(pts[:2, 0])]
-    eye_dist = float(eyes[1, 0] - eyes[0, 0])
-    if eye_dist < 1e-3:
-        return 0.0
-    mid_x = float(eyes[0, 0] + eyes[1, 0]) / 2.0
-    return (float(pts[2, 0]) - mid_x) / eye_dist
-
-
-def face_turn(face: np.ndarray) -> float:
-    """Sideways offset of the nose from the face's own centre line, in eye-distance units.
-
-    Same scale and sign as head_yaw (0 = facing the camera, positive = the person's LEFT), but
-    built so a FLAT PHOTO cannot fake it. The nose position is written as
-        nose - eye_mid = beta * (eye_vector) + alpha * (eye_mid -> mouth_mid vector)
-    and beta is returned. beta is unchanged by ANY affine transform of the picture - tilting,
-    rotating, sliding, shearing, or turning a flat photo about any axis - because those transforms
-    keep the same coefficients. Only genuine 3-D depth (the nose sticking out of the face) changes
-    it, which is exactly what a real head turn does. (head_yaw projects on the camera x axis, so
-    simply rolling a photo sideways changed it.)
-    """
-    pts = np.asarray(face[4:14], dtype=np.float32).reshape(5, 2)
-    eyes = pts[:2][np.argsort(pts[:2, 0])]          # camera-left eye first, independent of labelling
-    eye_vec = eyes[1] - eyes[0]
-    eye_mid = eyes.mean(axis=0)
-    down = pts[3:5].mean(axis=0) - eye_mid           # eye centre -> mouth centre
-    nose = pts[2] - eye_mid
-    det = float(eye_vec[0] * down[1] - eye_vec[1] * down[0])
-    if abs(det) < 0.2 * float(np.linalg.norm(eye_vec) * np.linalg.norm(down)) or abs(det) < 1e-3:
-        return 0.0                                   # degenerate landmarks: never counts as a turn
-    return float(nose[0] * down[1] - nose[1] * down[0]) / det
+    """Head yaw (see face_frame). Unlike a plain nose-vs-eyes offset this is NOT fooled by rolling
+    a photo in the hand. Returns 0.0 for a degenerate face."""
+    frame = face_frame(face)
+    return 0.0 if frame is None else frame[0]
 
 
 def image_quality(aligned: np.ndarray) -> tuple[float, float]:
@@ -195,69 +151,6 @@ class FaceEngine:
         return vec / norm if norm > 0 else vec
 
 
-# ---------------------------------------------------------------- passive photo / screen detector
-def _softmax(logits: np.ndarray) -> np.ndarray:
-    e = np.exp(logits - float(np.max(logits)))
-    return e / float(e.sum())
-
-
-def _scaled_crop(frame: np.ndarray, box: tuple, scale: float, size: int = 80) -> Optional[np.ndarray]:
-    """Crop the face box enlarged by `scale` around its centre (shifted, never squashed, to stay inside
-    the frame) and resize to size x size. The anti-spoof models were trained on this exact context crop:
-    they look at the surroundings (paper edge, phone bezel, screen glare), not just the skin."""
-    fh, fw = frame.shape[:2]
-    x, y, w, h = (float(v) for v in box)
-    x0, y0 = max(0.0, x), max(0.0, y)
-    w, h = min(fw - 1.0, x + w) - x0, min(fh - 1.0, y + h) - y0
-    if w < 8 or h < 8:
-        return None
-    scale = min((fh - 1) / h, (fw - 1) / w, scale)
-    new_w, new_h = w * scale, h * scale
-    cx, cy = x0 + w / 2, y0 + h / 2
-    left, top = cx - new_w / 2, cy - new_h / 2
-    right, bottom = left + new_w, top + new_h
-    if left < 0:
-        right, left = right - left, 0.0
-    if top < 0:
-        bottom, top = bottom - top, 0.0
-    if right > fw - 1:
-        left, right = left - (right - (fw - 1)), fw - 1.0
-    if bottom > fh - 1:
-        top, bottom = top - (bottom - (fh - 1)), fh - 1.0
-    l, t, r, b = (int(max(v, 0.0)) for v in (left, top, right, bottom))
-    crop = frame[t:b + 1, l:r + 1]
-    if crop.size == 0:
-        return None
-    return cv2.resize(crop, (size, size))
-
-
-class AntiSpoof:
-    """Photo / screen / print detector: the average of two MiniFASNet networks (different crop scales).
-
-    Output is the probability that the face is a LIVE person. A photo, a phone/tablet screen or a
-    printout normally scores low. Like every single-camera detector it is not infallible (see README);
-    that is why the app also demands a random head-turn. Use from ONE thread only.
-    """
-    REAL_CLASS = 1       # model outputs [spoof-A, REAL, spoof-B]
-
-    def __init__(self, models: Sequence[tuple[Path, float]]):
-        if not models:
-            raise ModelError("No anti-spoof models given.")
-        self._nets = [(cv2.dnn.readNetFromONNX(str(path)), float(scale)) for path, scale in models]
-
-    def real_probability(self, frame: np.ndarray, face: np.ndarray) -> float:
-        """P(live) in [0, 1] for one detected face in a full-resolution BGR frame."""
-        probs = []
-        for net, scale in self._nets:
-            crop = _scaled_crop(frame, face[:4], scale)
-            if crop is None:
-                return 0.0                           # unusable crop is never evidence of a live face
-            # trained on raw 0-255 BGR values (no mean/std, no /255)
-            net.setInput(np.ascontiguousarray(crop.astype(np.float32).transpose(2, 0, 1)[None]))
-            probs.append(float(_softmax(net.forward().reshape(-1))[self.REAL_CLASS]))
-        return float(np.mean(probs))
-
-
 # ---------------------------------------------------------------- gallery / matching
 @dataclass(frozen=True)
 class MatchResult:
@@ -275,6 +168,7 @@ class Gallery:
         self._labels = labels
         self._matrix = matrix
         self.names = names
+        self._groups = [np.flatnonzero(labels == i) for i in range(len(ids))]
 
     @classmethod
     def empty(cls) -> "Gallery":
@@ -301,11 +195,22 @@ class Gallery:
     def __len__(self) -> int:
         return len(self.ids)
 
-    def _per_identity(self, query: np.ndarray) -> np.ndarray:
+    def _per_identity(self, query: np.ndarray, topk: Optional[int] = None) -> np.ndarray:
+        """Score per identity = mean of its best `topk` samples (default config.MATCH_TOPK)."""
+        topk = config.MATCH_TOPK if topk is None else topk
         sims = self._matrix @ np.asarray(query, np.float32)
-        best = np.full(len(self.ids), -1.0, np.float32)
-        np.maximum.at(best, self._labels, sims)
-        return best
+        out = np.full(len(self.ids), -1.0, np.float32)
+        for i, idx in enumerate(self._groups):
+            group = sims[idx]
+            k = min(topk, len(group))
+            out[i] = group.max() if k <= 1 else np.partition(group, len(group) - k)[len(group) - k:].mean()
+        return out
+
+    def identity_score(self, reg_no: str, query: np.ndarray, topk: int = 1) -> float:
+        """Similarity of `query` to one identity's templates (-1 if unknown)."""
+        if reg_no not in self.ids:
+            return -1.0
+        return float(self._per_identity(query, topk)[self.ids.index(reg_no)])
 
     def match(self, query: np.ndarray) -> MatchResult:
         if not self.ids:
@@ -323,7 +228,7 @@ class Gallery:
         """Highest-scoring *other* identity for any of the given vectors (duplicate check)."""
         best: Optional[tuple[str, float]] = None
         for vec in vectors:
-            scores = self._per_identity(vec) if self.ids else np.zeros(0)
+            scores = self._per_identity(vec, topk=1) if self.ids else np.zeros(0)
             for reg_no, score in zip(self.ids, scores):
                 if reg_no == exclude:
                     continue

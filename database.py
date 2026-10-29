@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS embeddings (
     reg_no      TEXT NOT NULL REFERENCES students(reg_no) ON DELETE CASCADE,
     model       TEXT NOT NULL,
     vector      BLOB NOT NULL,
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    source      TEXT NOT NULL DEFAULT 'enroll'   -- enroll | update (admin) | auto (adaptive)
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_reg ON embeddings(reg_no);
 CREATE TABLE IF NOT EXISTS sessions (
@@ -103,6 +104,9 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as con:
             con.executescript(SCHEMA)
+            columns = {r["name"] for r in con.execute("PRAGMA table_info(embeddings)")}
+            if "source" not in columns:         # database created by version 2.0
+                con.execute("ALTER TABLE embeddings ADD COLUMN source TEXT NOT NULL DEFAULT 'enroll'")
 
     @contextmanager
     def _conn(self):
@@ -185,7 +189,7 @@ class Database:
                             (name, department, section, reg_no))
                 con.execute("DELETE FROM embeddings WHERE reg_no=?", (reg_no,))
             con.executemany(
-                "INSERT INTO embeddings(reg_no, model, vector, created_at) VALUES(?,?,?,?)",
+                "INSERT INTO embeddings(reg_no, model, vector, created_at, source) VALUES(?,?,?,?,'enroll')",
                 [(reg_no, model, np.asarray(v, "<f4").tobytes(), stamp) for v in vectors])
             con.execute("INSERT INTO audit_log(at, action, target, detail) VALUES(?,?,?,?)",
                         (stamp, "enroll" if row is None else "re-enroll", reg_no, f"{len(vectors)} samples"))
@@ -197,6 +201,31 @@ class Database:
             con.execute("UPDATE students SET active=0 WHERE reg_no=?", (reg_no,))
             con.execute("INSERT INTO audit_log(at, action, target, detail) VALUES(?,?,?,?)",
                         (now_str(), "remove-student", reg_no, "biometrics deleted"))
+
+    def add_templates(self, reg_no: str, vectors: Sequence[np.ndarray], model: str, source: str) -> int:
+        """Append face samples to an enrolled student WITHOUT touching the original enrollment
+        (source 'update' = admin-confirmed new look, 'auto' = learned after a live match).
+        Each source keeps only its newest N samples, so templates cannot grow without bound."""
+        if source not in ("update", "auto"):
+            raise ValueError("source must be 'update' or 'auto'")
+        if not vectors:
+            return 0
+        cap = config.MAX_UPDATE_TEMPLATES if source == "update" else config.MAX_AUTO_TEMPLATES
+        stamp = now_str()
+        with self._conn() as con:
+            row = con.execute("SELECT active FROM students WHERE reg_no=?", (reg_no,)).fetchone()
+            if row is None or not row["active"]:
+                raise ValueError(f"{reg_no} is not an enrolled student.")
+            con.executemany(
+                "INSERT INTO embeddings(reg_no, model, vector, created_at, source) VALUES(?,?,?,?,?)",
+                [(reg_no, model, np.asarray(v, "<f4").tobytes(), stamp, source) for v in vectors])
+            con.execute(
+                "DELETE FROM embeddings WHERE reg_no=? AND source=? AND id NOT IN "
+                "(SELECT id FROM embeddings WHERE reg_no=? AND source=? ORDER BY id DESC LIMIT ?)",
+                (reg_no, source, reg_no, source, cap))
+            con.execute("INSERT INTO audit_log(at, action, target, detail) VALUES(?,?,?,?)",
+                        (stamp, f"template-{source}", reg_no, f"{len(vectors)} sample(s) added"))
+        return len(vectors)
 
     def load_embeddings(self, model: str) -> list[tuple[str, str, np.ndarray]]:
         with self._conn() as con:
