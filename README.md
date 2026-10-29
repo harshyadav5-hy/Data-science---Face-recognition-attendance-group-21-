@@ -5,7 +5,7 @@ report/export to CSV. No TensorFlow, no training step.
 
 ## Why this replaces the CNN
 The old trainer learned to *classify* 44 people from ~5 images each, which is far too little data
-(it scored 1.89% - chance level - on the test split). Adding a student also meant retraining.
+(it scored 1.89% -chance level - on the test split). Adding a student also meant retraining.
 This version uses pretrained face **embeddings** (OpenCV YuNet detector + SFace recognizer):
 enrolling a person stores a few 128-number templates, and recognizing is a nearest-neighbour
 search. A new student takes about 30 seconds and needs no retraining.
