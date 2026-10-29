@@ -1,4 +1,4 @@
-"""Face detection (YuNet) + recognition (SFace) on OpenCV's built-in DNN module.
+"""Face detection (YuNet) +recognition (SFace) on OpenCV's built-in DNN module.
 
 There is no training step: enrolling a person means storing a few 128-d embeddings,
 and recognising means a nearest-neighbour search against them.
