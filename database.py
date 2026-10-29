@@ -1,4 +1,4 @@
-"""SQLite persistence: students, face embeddings, sessions, attendance, audit log, settings.
+"""SQLite persistence: students, face embeddings, sessions, attendance, audit-log, settings.
 
 Every call opens its own short-lived connection, so the GUI thread and worker threads
 can never trip over each other (SQLite connections must not be shared across threads).
