@@ -1,4 +1,4 @@
-"""Live-person / anti-photo / face-swap tests. No camera, no GUI, no model downloads needed.
+"""Live-person / anti-photo / face swap tests. No camera, no GUI, no model downloads needed.
 
 Faces are synthetic: a 3-D head (eyes, nose tip that sticks out, mouth corners) projected to YuNet-style
 landmarks, and a FLAT PHOTO of that head that can be tilted, rolled and rotated about any axis.
