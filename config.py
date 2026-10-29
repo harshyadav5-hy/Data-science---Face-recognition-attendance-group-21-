@@ -1,4 +1,4 @@
-"""Central configuration. Change values here - no other file needs editing."""
+"""Central configuration. Change values here -no other file needs editing."""
 from __future__ import annotations
 
 from pathlib import Path
