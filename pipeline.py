@@ -1,4 +1,4 @@
-"""Per-frame logic with no Qt and no camera, so it can be unit-tested.
+"""Per-frame logic with no Qt and no camera, so it can be unit tested.
 
 * AttendanceProcessor - tracks faces across frames and marks a student only when
     1. the face is recognised (several agreeing frames),
