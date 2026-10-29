@@ -55,7 +55,7 @@ MIN_FACE_PX = 90             # smaller faces are ignored (too unreliable)
 # Cosine similarity between SFace embeddings. OpenCV's documented "balanced" value is 0.363;
 # attendance cares more about false accepts (proxy attendance), so we start stricter.
 # TUNE THESE on your own students: see README "Calibrating".
-MATCH_THRESHOLD = 0.40
+MATCH_THRESHOLD = 0.50
 MATCH_MARGIN = 0.05          # best identity must beat the runner-up by this much
 DUPLICATE_THRESHOLD = 0.50   # at enrolment: refuse if the face already belongs to another Reg No
 
