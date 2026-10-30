@@ -1,4 +1,4 @@
-"""Face Attendance Pro - PyQt5 desktop application.
+"""Face Attendance Pro-PyQt5 desktop application.
 
 Run: python main.py
 """
